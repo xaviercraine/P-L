@@ -1,0 +1,91 @@
+-- ============================================================================
+-- Conv 8.5 — Guest Cancellation Flow
+-- fn_cancel_reservation: SECURITY DEFINER function callable only by service_role
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION fn_cancel_reservation(p_cancellation_token uuid)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+  v_reservation   record;
+  v_hotel         record;
+  v_seat          record;
+  v_block_start   time;
+  v_block_ts      timestamp;
+  v_now_local     timestamp;
+BEGIN
+  -- ── 1. Look up reservation by cancellation_token ──────────────────────
+  SELECT *
+    INTO v_reservation
+    FROM reservations
+   WHERE cancellation_token = p_cancellation_token;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('error', 'reservation_not_found');
+  END IF;
+
+  -- ── 2. Only 'succeeded' reservations can be cancelled ─────────────────
+  IF v_reservation.payment_status <> 'succeeded' THEN
+    RETURN jsonb_build_object('error', 'reservation_not_cancellable');
+  END IF;
+
+  -- ── 3. Get hotel timezone ─────────────────────────────────────────────
+  SELECT *
+    INTO v_hotel
+    FROM hotels
+   WHERE id = v_reservation.hotel_id;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('error', 'hotel_not_found');
+  END IF;
+
+  -- ── 4. Get seat label for the success response ────────────────────────
+  SELECT *
+    INTO v_seat
+    FROM seats
+   WHERE id = v_reservation.seat_id;
+
+  -- ── 5. Determine time block start time ────────────────────────────────
+  CASE v_reservation.time_block::text
+    WHEN 'full_day'  THEN v_block_start := '08:00:00'::time;
+    WHEN 'morning'   THEN v_block_start := '08:00:00'::time;
+    WHEN 'afternoon' THEN v_block_start := '13:00:00'::time;
+    ELSE
+      RETURN jsonb_build_object('error', 'server_error');
+  END CASE;
+
+  -- ── 6. Build block start as local timestamp; get current hotel time ───
+  v_block_ts  := v_reservation.reservation_date + v_block_start;
+  v_now_local := NOW() AT TIME ZONE v_hotel.timezone;
+
+  -- ── 7. Eligibility: must be >2 hours before block start ──────────────
+  IF v_block_ts - v_now_local <= interval '2 hours' THEN
+    RETURN jsonb_build_object('error', 'cancellation_window_closed');
+  END IF;
+
+  -- ── 8. Process cancellation ───────────────────────────────────────────
+  UPDATE reservations
+     SET payment_status       = 'refunded',
+         cancelled_at         = now(),
+         cancellation_reason  = 'guest_requested',
+         refund_amount_cents  = price_cents
+   WHERE id = v_reservation.id;
+
+  -- ── 9. Return success with details ────────────────────────────────────
+  RETURN jsonb_build_object(
+    'reservation_id',    v_reservation.id,
+    'seat_label',        COALESCE(v_seat.label, 'Unknown'),
+    'reservation_date',  v_reservation.reservation_date,
+    'time_block',        v_reservation.time_block,
+    'price_cents',       v_reservation.price_cents,
+    'refund_amount_cents', v_reservation.price_cents,
+    'currency',          v_reservation.currency
+  );
+END;
+$$;
+
+-- ── Security: only service_role can execute ─────────────────────────────
+REVOKE EXECUTE ON FUNCTION fn_cancel_reservation(uuid) FROM public, anon, authenticated;
+GRANT  EXECUTE ON FUNCTION fn_cancel_reservation(uuid) TO service_role;
